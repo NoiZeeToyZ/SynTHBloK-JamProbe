@@ -7,6 +7,7 @@
 //  Right-click: copy map summary to clipboard / save it to a text file.
 // ============================================================================
 #include "plugin.hpp"
+#include "GridController.hpp"
 #include <deque>
 #include <map>
 #include <mutex>
@@ -21,6 +22,7 @@ struct ProbeInput : midi::Input {
     std::map<int, ProbeStat>* stats = NULL;
     int* total = NULL;
     std::string* last = NULL;
+    const int* decode = NULL;   // decode as a grid controller profile (GridController.hpp), -1 = off
 
     void onMessage(const midi::Message& m) override {
         if (!mtx || m.bytes.empty()) return;
@@ -41,12 +43,18 @@ struct ProbeInput : midi::Input {
             case 0xC0: snprintf(buf, sizeof buf, "RX PC ch%-2d #%d", ch, a); key = (0xC0 << 8) | a; val = a; break;
             default:   snprintf(buf, sizeof buf, "RX %02X len%d %02X %02X", st, (int)m.bytes.size(), a, b); key = (0xF0 << 8) | (st & 0x0f); val = a; break;
         }
+        std::string line = buf;
+        // e.g. the lights a module sends to an APC / Launchpad profile, read back over a MIDI loopback
+        if (decode && *decode >= 0) {
+            std::string d = gridctl::describe(*decode, m.bytes.data(), (int)m.bytes.size());
+            if (!d.empty()) line += "  " + d;
+        }
         std::lock_guard<std::mutex> lk(*mtx);
         ProbeStat& s = (*stats)[key];
         s.count++; s.last = val; s.mn = std::min(s.mn, val); s.mx = std::max(s.mx, val); s.ch = ch;
         (*total)++;
         if (last) *last = std::string(buf + 3);
-        log->push_back(buf);
+        log->push_back(line);
         while (log->size() > 64) log->pop_front();
     }
 };
@@ -64,6 +72,7 @@ struct SynTHBloKJamProbe : Module {
     std::map<int, ProbeStat> stats;
     int total = 0;
     std::string lastMsg;
+    int decodeKind = -1;   // "Decode as controller" (menu)
 
     dsp::SchmittTrigger sendTrig, offTrig, clearTrig, saveTrig, copyTrig, litTrig;
     struct LitInfo { int ch = 1, val = 0; };
@@ -98,7 +107,7 @@ struct SynTHBloKJamProbe : Module {
         configSwitch(LOOP_PARAM, 0.f, 1.f, 0.f, "Auto probe loops", {"Once", "Loop"});
         paramQuantities[NUM_PARAM]->snapEnabled = true;
         paramQuantities[VAL_PARAM]->snapEnabled = true;
-        midiIn.mtx = &mtx; midiIn.log = &log; midiIn.stats = &stats; midiIn.total = &total; midiIn.last = &lastMsg;
+        midiIn.mtx = &mtx; midiIn.log = &log; midiIn.stats = &stats; midiIn.total = &total; midiIn.last = &lastMsg; midiIn.decode = &decodeKind;
     }
 
     void addLog(const std::string& s) {
@@ -260,11 +269,13 @@ struct SynTHBloKJamProbe : Module {
         json_t* r = json_object();
         json_object_set_new(r, "in", midiIn.toJson());
         json_object_set_new(r, "out", midiOut.toJson());
+        json_object_set_new(r, "decode", json_integer(decodeKind));
         return r;
     }
     void dataFromJson(json_t* r) override {
         if (json_t* j = json_object_get(r, "in")) midiIn.fromJson(j);
         if (json_t* j = json_object_get(r, "out")) midiOut.fromJson(j);
+        if (json_t* j = json_object_get(r, "decode")) decodeKind = clamp((int)json_integer_value(j), -1, gridctl::NUM_KINDS - 1);
     }
 };
 
@@ -487,6 +498,13 @@ struct SynTHBloKJamProbeWidget : ModuleWidget {
             glfwSetClipboardString(APP->window->win, m->summary().c_str());
         }));
         menu->addChild(createMenuItem("Save map summary to Rack user folder", "", [=]() { m->doSave = true; }));
+        // Testing a controller profile without the controller: point a module's MIDI IN / OUT at Rack's loopback,
+        // send the device's numbers from here (TX) and read the module's lights decoded in the log
+        menu->addChild(createSubmenuItem("Decode as controller", m->decodeKind < 0 ? "Off" : gridctl::kProfiles[m->decodeKind].label, [=](Menu* sub) {
+            sub->addChild(createCheckMenuItem("Off", "", [=]() { return m->decodeKind < 0; }, [=]() { m->decodeKind = -1; }));
+            for (int k = 0; k < gridctl::NUM_KINDS; k++)
+                sub->addChild(createCheckMenuItem(gridctl::kProfiles[k].label, "", [=]() { return m->decodeKind == k; }, [=]() { m->decodeKind = k; }));
+        }));
     }
 };
 
